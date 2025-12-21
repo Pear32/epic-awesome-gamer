@@ -34,14 +34,7 @@ URL_PRODUCT_BUNDLES = "https://store.epicgames.com/en-US/bundles/"
 
 
 def get_promotions() -> List[PromotionGame]:
-    """
-    获取周免游戏数据
-
-    <即将推出> promotion["promotions"]["upcomingPromotionalOffers"]
-    <本周免费> promotion["promotions"]["promotionalOffers"]
-    :return: {"pageLink1": "pageTitle1", "pageLink2": "pageTitle2", ...}
-    """
-
+    """获取周免游戏数据"""
     def is_discount_game(prot: dict) -> bool | None:
         with suppress(KeyError, IndexError, TypeError):
             offers = prot["promotions"]["promotionalOffers"][0]["promotionalOffers"]
@@ -66,50 +59,38 @@ def get_promotions() -> List[PromotionGame]:
 
     # Get store promotion data and <this week free> games
     for e in data["data"]["Catalog"]["searchStore"]["elements"]:
-
-        # Remove items that are discounted but not free.
         if not is_discount_game(e):
             continue
 
-        # package free games
         try:
             e["url"] = f"{URL_PRODUCT_PAGE.rstrip('/')}/{e['offerMappings'][0]['pageSlug']}"
         except (KeyError, IndexError):
             if e.get("productSlug"):
-                # [修复 1] 优先使用商品页 (/p/) 而非捆绑包页 (/bundles/)
                 e["url"] = f"{URL_PRODUCT_PAGE.rstrip('/')}/{e['productSlug']}"
             else:
                 logger.info(f"Failed to get URL: {e}")
                 continue
 
         logger.info(e["url"])
-
         promotions.append(PromotionGame(**e))
 
     return promotions
 
 
 class EpicAgent:
-
     def __init__(self, page: Page):
         self.page = page
-
         self.epic_games = EpicGames(self.page)
-
         self._promotions: List[PromotionGame] = []
         self._ctx_cookies_is_available: bool = False
         self._orders: List[OrderItem] = []
         self._namespaces: List[str] = []
-
         self._cookies = None
 
     async def _sync_order_history(self):
-        """获取最近的订单纪录"""
         if self._orders:
             return
-
         completed_orders: List[OrderItem] = []
-
         try:
             await self.page.goto("https://www.epicgames.com/account/v2/payment/ajaxGetOrderHistory")
             text_content = await self.page.text_content("//pre")
@@ -124,45 +105,24 @@ class EpicAgent:
                     completed_orders.append(item)
         except Exception as err:
             logger.warning(err)
-
         self._orders = completed_orders
 
     async def _check_orders(self):
-        # 获取玩家历史交易订单
-        # 运行该操作之前必须确保账号信息有效
         await self._sync_order_history()
-
         self._namespaces = self._namespaces or [order.namespace for order in self._orders]
-
-        # 获取本周促销数据
-        # 正交数据，得到还未收集的优惠商品
         self._promotions = [p for p in get_promotions() if p.namespace not in self._namespaces]
 
     async def _should_ignore_task(self) -> bool:
         self._ctx_cookies_is_available = False
-
-        # 判断浏览器是否已缓存账号令牌信息
         await self.page.goto(URL_CLAIM, wait_until="domcontentloaded")
-
-        # == 令牌过期 == #
         status = await self.page.locator("//egs-navigation").get_attribute("isloggedin")
         if status == "false":
             logger.error("❌ context cookies is not available")
             return False
-
-        # == 令牌有效 == #
-
-        # 浏览器的身份信息仍然有效
         self._ctx_cookies_is_available = True
-
-        # 加载正交的优惠商品数据
         await self._check_orders()
-
-        # 促销列表为空，说明免费游戏都已收集，任务结束
         if not self._promotions:
             return True
-
-        # 账号信息有效，但还存在没有领完的游戏
         return False
 
     async def collect_epic_games(self):
@@ -170,11 +130,9 @@ class EpicAgent:
             logger.success("All week-free games are already in the library")
             return
 
-        # 刷新浏览器身份信息
         if not self._ctx_cookies_is_available:
             return
 
-        # 加载正交的优惠商品数据
         if not self._promotions:
             await self._check_orders()
 
@@ -182,26 +140,22 @@ class EpicAgent:
             logger.success("All week-free games are already in the library")
             return
 
-        # [修复 2] 移除 Bundle 过滤逻辑
         for p in self._promotions:
             pj = json.dumps({"title": p.title, "url": p.url}, indent=2, ensure_ascii=False)
             logger.debug(f"Discover promotion \n{pj}")
 
-        # 收集所有优惠游戏
         if self._promotions:
             try:
                 await self.epic_games.collect_weekly_games(self._promotions)
             except Exception as e:
                 logger.exception(e)
-
+        
         logger.debug("All tasks in the workflow have been completed")
 
 
 class EpicGames:
-
     def __init__(self, page: Page):
         self.page = page
-
         self._promotions: List[PromotionGame] = []
 
     @staticmethod
@@ -216,68 +170,93 @@ class EpicGames:
     @staticmethod
     async def _active_purchase_container(page: Page):
         logger.debug("Move to webPurchaseContainer iframe")
-
-        wpc = page.frame_locator("//iframe[@class='']")
-        payment_btn = wpc.locator("//div[@class='payment-order-confirm']")
-        with suppress(Exception):
-            await expect(payment_btn).to_be_attached()
-        await page.wait_for_timeout(2000)
-        await payment_btn.click(timeout=6000)
-
+        # 寻找支付弹窗的 iframe
+        wpc = page.frame_locator("//iframe[contains(@id, 'webPurchaseContainer')]")
+        # 你的截图中按钮是蓝色的 "PLACE ORDER"，对应这个定位器
+        payment_btn = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
+        
+        try:
+            await expect(payment_btn).to_be_visible(timeout=10000)
+        except AssertionError:
+             # 备用定位器
+            payment_btn = wpc.locator("//div[@class='payment-order-confirm']")
+            await expect(payment_btn).to_be_visible(timeout=5000)
+            
         return wpc, payment_btn
 
     @staticmethod
     async def _uk_confirm_order(wpc: FrameLocator):
         logger.debug("UK confirm order")
-
-        # <-- Handle UK confirm-order
+        # 处理可能的确认按钮，例如你的截图中的 PLACE ORDER
         with suppress(TimeoutError):
-            accept = wpc.locator(
-                "//button[contains(@class, 'payment-confirm__btn payment-btn--primary')]"
-            )
+            # 优先匹配 "PLACE ORDER" 按钮
+            accept = wpc.locator("//button[contains(@class, 'payment-confirm__btn')]")
             if await accept.is_enabled(timeout=5000):
                 await accept.click()
                 return True
 
-    @staticmethod
-    async def add_promotion_to_cart(page: Page, urls: List[str]) -> bool:
-        has_pending_free_promotion = False
+    async def _handle_instant_checkout(self, page: Page):
+        """处理点击 'Get' 后弹出的即时结账窗口"""
+        logger.info("🚀 Triggering Instant Checkout Flow...")
+        
+        # 初始化验证码处理代理
+        agent = AgentV(page=page, agent_config=settings)
 
-        # --> Add promotions to Cart
+        try:
+            # 1. 等待并定位 iframe 里的 Place Order 按钮
+            logger.debug("Waiting for checkout iframe...")
+            wpc, payment_btn = await self._active_purchase_container(page)
+            
+            # 2. 点击下单
+            logger.debug("Clicking Place Order...")
+            await payment_btn.click()
+            
+            # 3. 处理可能的验证码
+            logger.debug("Checking for CAPTCHA...")
+            await agent.wait_for_challenge()
+            
+            # 4. 等待“谢谢”弹窗或页面跳转，标志成功
+            # 成功后弹窗通常会关闭，或者显示 Thank you
+            logger.success("🎉 Instant Checkout Success!")
+            
+        except Exception as err:
+            logger.error(f"Instant checkout failed: {err}")
+            # 尝试刷新页面恢复状态
+            await page.reload()
+
+    async def add_promotion_to_cart(self, page: Page, urls: List[str]) -> bool:
+        has_pending_cart_items = False
+
         for url in urls:
             await page.goto(url, wait_until="load")
 
-            # <-- Handle pre-page (Age Gate / Content Warning)
-            # [关键修复] 启用点击 "Continue" 按钮的逻辑
+            # 1. 处理弹窗 (Continue)
             try:
                 continue_btn = page.locator("//button//span[text()='Continue']")
                 if await continue_btn.is_visible(timeout=5000):
                     logger.debug("Found Content Warning, clicking Continue...")
                     await continue_btn.click()
-                    await page.wait_for_load_state("networkidle")
             except Exception:
-                pass # 没弹窗就忽略
+                pass 
 
-            # 检查游戏是否已在库
+            # 2. 检查库状态
             btn_list = page.locator("//aside//button")
             try:
                 aside_btn_count = await btn_list.count()
             except TimeoutError:
-                # 如果页面加载太慢或被完全拦截
                 logger.warning(f"Failed to load game page buttons - {url=}")
                 continue
 
             texts = ""
             for i in range(aside_btn_count):
                 btn = btn_list.nth(i)
-                btn_text_content = await btn.text_content()
-                texts += btn_text_content
+                texts += await btn.text_content()
 
             if "In Library" in texts:
                 logger.success(f"Already in the library - {url=}")
                 continue
 
-            # 检查是否为免费游戏
+            # 3. 定位核心按钮
             purchase_btn = page.locator("//aside//button[@data-testid='purchase-cta-button']")
             try:
                 purchase_status = await purchase_btn.text_content(timeout=5000)
@@ -285,51 +264,41 @@ class EpicGames:
                 logger.warning(f"Could not find purchase button - {url=}")
                 continue
 
-            if "Buy Now" in purchase_status or "Get" not in purchase_status:
+            if "Buy Now" in purchase_status or ("Get" not in purchase_status and "Add To Cart" not in purchase_status):
                 logger.warning(f"Not available for purchase - {url=}")
                 continue
 
-            # 将免费游戏添加至购物车
-            add_to_cart_btn = page.locator("//aside//button[@data-testid='add-to-cart-cta-button']")
+            # 4. 智能分支处理
             try:
-                text = await add_to_cart_btn.text_content(timeout=10000)
-                if text == "View In Cart":
-                    logger.debug(f"🙌 Already in the shopping cart - {url=}")
-                    has_pending_free_promotion = True
-                elif text == "Add To Cart" or text == "Get": # 有时候是 Get
-                    await add_to_cart_btn.click()
-                    logger.debug(f"🙌 Add to the shopping cart - {url=}")
-                    # 等待按钮变成 "View In Cart" 或者直接跳转
+                target_btn = purchase_btn # 默认直接点大按钮
+                text = await target_btn.text_content()
+                
+                if "Get" in text:
+                    # === [新逻辑] 即时结账流程 ===
+                    logger.debug(f"👉 Found 'Get' button, starting instant checkout - {url=}")
+                    await target_btn.click()
+                    # 直接在当前页面处理弹窗，不需要去购物车
+                    await self._handle_instant_checkout(page)
+                    
+                elif "Add To Cart" in text:
+                    # === [旧逻辑] 购物车流程 ===
+                    logger.debug(f"🛒 Found 'Add To Cart' button - {url=}")
+                    await target_btn.click()
+                    # 等待变成 View In Cart
                     with suppress(TimeoutError):
-                         await expect(add_to_cart_btn).to_have_text("View In Cart", timeout=10000)
-                    has_pending_free_promotion = True
+                         await expect(target_btn).to_have_text("View In Cart", timeout=10000)
+                    has_pending_cart_items = True
 
             except Exception as err:
-                logger.warning(f"Failed to add promotion to cart - {err}")
+                logger.warning(f"Failed to process game - {err}")
                 continue
 
-        return has_pending_free_promotion
+        return has_pending_cart_items
 
     async def _empty_cart(self, page: Page, wait_rerender: int = 30) -> bool | None:
-        """
-        URL_CART = "https://store.epicgames.com/en-US/cart"
-        URL_WISHLIST = "https://store.epicgames.com/en-US/wishlist"
-        //span[text()='Your Cart is empty.']
-
-        Args:
-            wait_rerender:
-            page:
-
-        Returns:
-
-        """
         has_paid_free = False
-
         try:
-            # Check all items in the shopping cart
             cards = await page.query_selector_all("//div[@data-testid='offer-card-layout-wrapper']")
-
-            # Move paid games to the wishlist
             for card in cards:
                 is_free = await card.query_selector("//span[text()='Free']")
                 if not is_free:
@@ -339,10 +308,6 @@ class EpicGames:
                     )
                     await wishlist_btn.click()
 
-            # Wait up to 60 seconds for the page to re-render.
-            # Usually it takes 1~3s for the web page to be re-rendered
-            # - Set threshold for overflow in case of poor Epic network
-            # - It can also prevent extreme situations, such as: the user’s shopping cart has nearly a hundred products
             if has_paid_free and wait_rerender:
                 wait_rerender -= 1
                 await page.wait_for_timeout(2000)
@@ -353,30 +318,19 @@ class EpicGames:
             return False
 
     async def _purchase_free_game(self):
-        # == Cart Page == #
         await self.page.goto(URL_CART, wait_until="domcontentloaded")
-
         logger.debug("Move ALL paid games from the shopping cart out")
         await self._empty_cart(self.page)
 
-        # {{< Insert hCaptcha Challenger >}}
         agent = AgentV(page=self.page, agent_config=settings)
-
-        # --> Check out cart
         await self.page.click("//button//span[text()='Check Out']")
-
-        # <-- Handle Any LICENSE
         await self._agree_license(self.page)
 
         try:
-            # --> Move to webPurchaseContainer iframe
             logger.debug("Move to webPurchaseContainer iframe")
             wpc, payment_btn = await self._active_purchase_container(self.page)
             logger.debug("Click payment button")
-            # <-- Handle UK confirm-order
             await self._uk_confirm_order(wpc)
-
-            # {{< Active >}}
             await agent.wait_for_challenge()
         except Exception as err:
             logger.warning(f"Failed to solve captcha - {err}")
@@ -385,16 +339,19 @@ class EpicGames:
 
     @retry(retry=retry_if_exception_type(TimeoutError), stop=stop_after_attempt(2), reraise=True)
     async def collect_weekly_games(self, promotions: List[PromotionGame]):
-        # --> Make sure promotion is not in the library before executing
         urls = [p.url for p in promotions]
-        if not await self.add_promotion_to_cart(self.page, urls):
-            logger.success("All week-free games are already in the library")
-            return
+        
+        # add_promotion_to_cart 现在会处理 "Get" 类型的即时领取
+        # 并返回 True 仅当有 "Add To Cart" 类型的物品被加车时
+        has_cart_items = await self.add_promotion_to_cart(self.page, urls)
 
-        await self._purchase_free_game()
-
-        try:
-            await self.page.wait_for_url(URL_CART_SUCCESS)
-            logger.success("🎉 Successfully collected all weekly games")
-        except TimeoutError:
-            logger.warning("Failed to collect all weekly games")
+        # 只有当确实有东西在购物车里时，才去购物车页面结账
+        if has_cart_items:
+            await self._purchase_free_game()
+            try:
+                await self.page.wait_for_url(URL_CART_SUCCESS)
+                logger.success("🎉 Successfully collected cart games")
+            except TimeoutError:
+                logger.warning("Failed to collect cart games")
+        else:
+            logger.success("🎉 Process completed (Instant claimed or already owned)")
