@@ -25,7 +25,7 @@ jobs:
           enable-cache: true
 
       - name: Set up Python
-        run: uv python install 3.12
+        run: uv python install 3.10
 
       - name: Install system dependencies
         run: |
@@ -33,15 +33,17 @@ jobs:
           sudo apt-get install -y xvfb libxml2-dev libxslt-dev
 
       - name: Install dependencies
-        run: uv sync
+        run: 
+          uv sync
+          uv pip install --upgrade pip
 
       # 增加 GITHUB_TOKEN 以解决 Camoufox 下载时的 403 频率限制
       - name: Install Camoufox
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: 
-          pip install camoufox
-          python -m camoufox install
+          uv pip install camoufox
+          python -m camoufox install --with-depsl
 
       - name: Run Epic Awesome Gamer
         env:
