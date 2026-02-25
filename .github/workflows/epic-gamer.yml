@@ -39,7 +39,9 @@ jobs:
       - name: Install Camoufox
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: uv run camoufox fetch
+        run: 
+          pip install camoufox
+          python -m camoufox install
 
       - name: Run Epic Awesome Gamer
         env:
